@@ -1,7 +1,9 @@
 import argparse
+import heapq
 import itertools
 import math
 import os
+import random
 from pathlib import Path
 from typing import Optional
 from contextlib import nullcontext
@@ -61,6 +63,13 @@ def parse_args():
         type=str,
         default=None,
         help="The prompt with identifier specifying the instance",
+    )
+    parser.add_argument(
+        "--prompt_file_path",
+        type=str,
+        default=None,
+        required=False,
+        help="The path of a file with filename-prompt pairs",
     )
     parser.add_argument(
         "--class_prompt",
@@ -146,7 +155,7 @@ def parse_args():
         default="constant",
         help=(
             'The scheduler type to use. Choose between ["linear", "cosine", "cosine_with_restarts", "polynomial",'
-            ' "constant", "constant_with_warmup"]'
+            ' "constant", "constant_with_warmup", "onecycle"]'
         ),
     )
     parser.add_argument(
@@ -191,6 +200,7 @@ def parse_args():
     )
     parser.add_argument("--not_cache_latents", action="store_true", help="Do not precompute and cache latents from VAE.")
     parser.add_argument("--local_rank", type=int, default=-1, help="For distributed training: local_rank")
+    parser.add_argument("--no_prompt_chance", type=int, default=0, help="Chance for empty prompt to be used during training")
 
     args = parser.parse_args()
     env_local_rank = int(os.environ.get("LOCAL_RANK", -1))
@@ -224,6 +234,7 @@ class DreamBoothDataset(Dataset):
         class_prompt=None,
         size=512,
         center_crop=False,
+        prompt_file_path=None,
     ):
         self.size = size
         self.center_crop = center_crop
@@ -238,6 +249,19 @@ class DreamBoothDataset(Dataset):
         self.instance_prompt = instance_prompt
         self._length = self.num_instance_images
 
+        if prompt_file_path is not None:
+            if not Path(prompt_file_path).exists():
+                raise ValueError("Prompt file doesn't exists.")
+            self.filename_to_prompt = {}
+            with open(prompt_file_path) as f:
+                for line in f:
+                    if not line:
+                        continue
+                    name, prompt = line.strip().split(":")
+                    self.filename_to_prompt[name.strip()] = prompt.strip()
+        else:
+            self.filename_to_prompt = None
+
         if class_data_root is not None:
             self.class_data_root = Path(class_data_root)
             self.class_data_root.mkdir(parents=True, exist_ok=True)
@@ -250,8 +274,8 @@ class DreamBoothDataset(Dataset):
 
         self.image_transforms = transforms.Compose(
             [
-                transforms.Resize(size, interpolation=transforms.InterpolationMode.BILINEAR),
-                transforms.CenterCrop(size) if center_crop else transforms.RandomCrop(size),
+                # transforms.Resize(size, interpolation=transforms.InterpolationMode.BILINEAR),
+                # transforms.CenterCrop(size) if center_crop else transforms.RandomCrop(size),
                 transforms.ToTensor(),
                 transforms.Normalize([0.5], [0.5]),
             ]
@@ -262,12 +286,24 @@ class DreamBoothDataset(Dataset):
 
     def __getitem__(self, index):
         example = {}
-        instance_image = Image.open(self.instance_images_path[index % self.num_instance_images])
+        image_path = self.instance_images_path[index % self.num_instance_images]
+
+        example["image_path"] = image_path
+        prompt = self.instance_prompt
+        if self.filename_to_prompt:
+            name = os.path.basename(image_path)
+            # Use same caption for flipped images
+            if name.startswith("f_"):
+                name = name[2:]
+            if name in self.filename_to_prompt:
+                prompt = self.filename_to_prompt[name]
+
+        instance_image = Image.open(image_path)
         if not instance_image.mode == "RGB":
             instance_image = instance_image.convert("RGB")
         example["instance_images"] = self.image_transforms(instance_image)
         example["instance_prompt_ids"] = self.tokenizer(
-            self.instance_prompt,
+            prompt,
             padding="do_not_pad",
             truncation=True,
             max_length=self.tokenizer.model_max_length,
@@ -306,15 +342,24 @@ class PromptDataset(Dataset):
 
 
 class LatentsDataset(Dataset):
-    def __init__(self, latents_cache, text_encoder_cache):
+    def __init__(self, latents_cache, text_encoder_cache, empty_latent=None, no_prompt_chance=0, paths=None):
         self.latents_cache = latents_cache
         self.text_encoder_cache = text_encoder_cache
+        if no_prompt_chance > 0 and empty_latent is None:
+            raise ValueError("empty_latent must exist if no_prompt_chance is greater than 0")
+        self.no_prompt_chance = no_prompt_chance
+        self.empty_latent = empty_latent
+        self.paths = paths
+        logger.warning("# paths: %s", len(paths))
 
     def __len__(self):
         return len(self.latents_cache)
 
     def __getitem__(self, index):
-        return self.latents_cache[index], self.text_encoder_cache[index]
+        text_latent = self.text_encoder_cache[index]
+        if random.random() < self.no_prompt_chance:
+            text_latent = self.empty_latent
+        return self.latents_cache[index], text_latent, self.paths[index] if self.paths else None
 
 
 class AverageMeter:
@@ -477,11 +522,13 @@ def main():
         tokenizer=tokenizer,
         size=args.resolution,
         center_crop=args.center_crop,
+        prompt_file_path=args.prompt_file_path,
     )
 
     def collate_fn(examples):
         input_ids = [example["instance_prompt_ids"] for example in examples]
         pixel_values = [example["instance_images"] for example in examples]
+        paths = [example["image_path"] for example in examples]
 
         # Concat class and instance examples for prior preservation.
         # We do this to avoid doing two forward passes.
@@ -497,6 +544,7 @@ def main():
         batch = {
             "input_ids": input_ids,
             "pixel_values": pixel_values,
+            "paths": paths,
         }
         return batch
 
@@ -520,16 +568,20 @@ def main():
     if not args.not_cache_latents:
         latents_cache = []
         text_encoder_cache = []
+        paths = []
         for batch in tqdm(train_dataloader, desc="Caching latents"):
             with torch.no_grad():
                 batch["pixel_values"] = batch["pixel_values"].to(accelerator.device, non_blocking=True, dtype=weight_dtype)
                 batch["input_ids"] = batch["input_ids"].to(accelerator.device, non_blocking=True)
                 latents_cache.append(vae.encode(batch["pixel_values"]).latent_dist)
+                paths += batch["paths"]
                 if args.train_text_encoder:
                     text_encoder_cache.append(batch["input_ids"])
                 else:
                     text_encoder_cache.append(text_encoder(batch["input_ids"])[0])
-        train_dataset = LatentsDataset(latents_cache, text_encoder_cache)
+
+        empty_latent = text_encoder(torch.LongTensor([[]]).to(accelerator.device))[0]
+        train_dataset = LatentsDataset(latents_cache, text_encoder_cache, empty_latent=empty_latent, no_prompt_chance=args.no_prompt_chance, paths=paths)
         train_dataloader = torch.utils.data.DataLoader(train_dataset, batch_size=1, collate_fn=lambda x: x, shuffle=True)
 
         del vae
@@ -545,12 +597,19 @@ def main():
         args.max_train_steps = args.num_train_epochs * num_update_steps_per_epoch
         overrode_max_train_steps = True
 
-    lr_scheduler = get_scheduler(
-        args.lr_scheduler,
-        optimizer=optimizer,
-        num_warmup_steps=args.lr_warmup_steps * args.gradient_accumulation_steps,
-        num_training_steps=args.max_train_steps * args.gradient_accumulation_steps,
-    )
+    if args.lr_scheduler == "onecycle":
+        lr_scheduler = torch.optim.lr_scheduler.OneCycleLR(
+            optimizer,
+            args.learning_rate,
+            total_steps=args.max_train_steps * args.gradient_accumulation_steps
+        )
+    else:
+        lr_scheduler = get_scheduler(
+            args.lr_scheduler,
+            optimizer=optimizer,
+            num_warmup_steps=args.lr_warmup_steps * args.gradient_accumulation_steps,
+            num_training_steps=args.max_train_steps * args.gradient_accumulation_steps,
+        )
 
     if args.train_text_encoder:
         unet, text_encoder, optimizer, train_dataloader, lr_scheduler = accelerator.prepare(
@@ -589,6 +648,7 @@ def main():
     progress_bar.set_description("Steps")
     global_step = 0
     loss_avg = AverageMeter()
+    loss_heap = []
     text_enc_context = nullcontext() if args.train_text_encoder else torch.no_grad()
     for epoch in range(args.num_train_epochs):
         unet.train()
@@ -660,6 +720,8 @@ def main():
                 progress_bar.set_postfix(**logs)
                 accelerator.log(logs, step=global_step)
 
+            loss_heap.append({"loss": loss.item(), "paths": [str(b[2]) for b in batch]})
+
             progress_bar.update(1)
             global_step += 1
 
@@ -689,6 +751,13 @@ def main():
             repo.push_to_hub(commit_message="End of training", blocking=False, auto_lfs_prune=True)
 
     accelerator.end_training()
+    try:
+        largest = heapq.nlargest(20, loss_heap, key=lambda x : x["loss"])
+        for l in largest:
+            logger.warning(str(l))
+    except:
+        pass
+
 
 
 if __name__ == "__main__":
