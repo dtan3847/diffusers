@@ -200,7 +200,7 @@ def parse_args():
     )
     parser.add_argument("--not_cache_latents", action="store_true", help="Do not precompute and cache latents from VAE.")
     parser.add_argument("--local_rank", type=int, default=-1, help="For distributed training: local_rank")
-    parser.add_argument("--no_prompt_chance", type=int, default=0, help="Chance for empty prompt to be used during training")
+    parser.add_argument("--no_prompt_chance", type=float, default=0, help="Chance for empty prompt to be used during training")
 
     args = parser.parse_args()
     env_local_rank = int(os.environ.get("LOCAL_RANK", -1))
@@ -579,12 +579,16 @@ def main():
                     text_encoder_cache.append(batch["input_ids"])
                 else:
                     text_encoder_cache.append(text_encoder(batch["input_ids"])[0])
-
-        text_encoder.to(accelerator.device, dtype=weight_dtype)
-        input_ids = tokenizer("", padding="do_not_pad", truncation=True, max_length=tokenizer.model_max_length).input_ids
-        padded = tokenizer.pad({"input_ids": [input_ids]}, padding=True, return_tensors="pt").input_ids
-        empty_latent = text_encoder(padded.to(accelerator.device))[0]
-        text_encoder.cpu()
+        with torch.no_grad():
+            input_ids = tokenizer("", padding="do_not_pad", truncation=True, max_length=tokenizer.model_max_length).input_ids
+            padded = tokenizer.pad({"input_ids": [input_ids]}, padding=True, return_tensors="pt").input_ids
+            if not args.train_text_encoder:
+                text_encoder.to(accelerator.device, dtype=weight_dtype)
+                empty_latent = text_encoder(padded.to(accelerator.device))[0]
+                text_encoder.cpu()
+            else:
+                # Use token ids list as empty latent
+                empty_latent = padded
 
         train_dataset = LatentsDataset(latents_cache, text_encoder_cache, empty_latent=empty_latent, no_prompt_chance=args.no_prompt_chance, paths=paths)
         train_dataloader = torch.utils.data.DataLoader(train_dataset, batch_size=1, collate_fn=lambda x: x, shuffle=True)
@@ -599,21 +603,22 @@ def main():
     overrode_max_train_steps = False
     num_update_steps_per_epoch = math.ceil(len(train_dataloader) / args.gradient_accumulation_steps)
     if args.max_train_steps is None:
-        args.max_train_steps = args.num_train_epochs * num_update_steps_per_epoch
+        args.max_train_steps = args.num_train_epochs * len(train_dataloader)
         overrode_max_train_steps = True
+
 
     if args.lr_scheduler == "onecycle":
         lr_scheduler = torch.optim.lr_scheduler.OneCycleLR(
             optimizer,
             args.learning_rate,
-            total_steps=args.max_train_steps * args.gradient_accumulation_steps
+            total_steps=args.max_train_steps,
         )
     else:
         lr_scheduler = get_scheduler(
             args.lr_scheduler,
             optimizer=optimizer,
-            num_warmup_steps=args.lr_warmup_steps * args.gradient_accumulation_steps,
-            num_training_steps=args.max_train_steps * args.gradient_accumulation_steps,
+            num_warmup_steps=args.lr_warmup_steps,
+            num_training_steps=args.max_train_steps,
         )
 
     if args.train_text_encoder:
@@ -628,7 +633,7 @@ def main():
     # We need to recalculate our total training steps as the size of the training dataloader may have changed.
     num_update_steps_per_epoch = math.ceil(len(train_dataloader) / args.gradient_accumulation_steps)
     if overrode_max_train_steps:
-        args.max_train_steps = args.num_train_epochs * num_update_steps_per_epoch
+        args.max_train_steps = args.num_train_epochs * len(train_dataloader)
     # Afterwards we recalculate our number of training epochs
     args.num_train_epochs = math.ceil(args.max_train_steps / num_update_steps_per_epoch)
 
@@ -715,13 +720,16 @@ def main():
                 #         else unet.parameters()
                 #     )
                 #     accelerator.clip_grad_norm_(params_to_clip, args.max_grad_norm)
-                optimizer.step()
+                if not math.isnan(loss.item()):
+                    optimizer.step()
+                    optimizer.zero_grad(set_to_none=True)
+                    loss_avg.update(loss.detach_(), bsz)
+                else:
+                    logger.warning("nan loss. noise=%s, noise_pred=%s, paths=%s",noise, noise_pred, [str(b[2]) for b in batch])
                 lr_scheduler.step()
-                optimizer.zero_grad(set_to_none=True)
-                loss_avg.update(loss.detach_(), bsz)
 
             if not global_step % args.log_interval:
-                logs = {"loss": loss_avg.avg.item(), "lr": lr_scheduler.get_last_lr()[0]}
+                logs = {"loss": loss.item(), "loss_avg": loss_avg.avg.item(), "lr": lr_scheduler.get_last_lr()[0]}
                 progress_bar.set_postfix(**logs)
                 accelerator.log(logs, step=global_step)
 
