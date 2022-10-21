@@ -580,10 +580,12 @@ def main():
                 else:
                     text_encoder_cache.append(text_encoder(batch["input_ids"])[0])
 
+        text_encoder.to(accelerator.device, dtype=weight_dtype)
         input_ids = tokenizer("", padding="do_not_pad", truncation=True, max_length=tokenizer.model_max_length).input_ids
         padded = tokenizer.pad({"input_ids": [input_ids]}, padding=True, return_tensors="pt").input_ids
         empty_latent = text_encoder(padded.to(accelerator.device))[0]
-        
+        text_encoder.cpu()
+
         train_dataset = LatentsDataset(latents_cache, text_encoder_cache, empty_latent=empty_latent, no_prompt_chance=args.no_prompt_chance, paths=paths)
         train_dataloader = torch.utils.data.DataLoader(train_dataset, batch_size=1, collate_fn=lambda x: x, shuffle=True)
 
@@ -680,11 +682,11 @@ def main():
                 with text_enc_context:
                     if not args.not_cache_latents:
                         if args.train_text_encoder:
-                            encoder_hidden_states = text_encoder(batch[0][1])[0]
+                            encoder_hidden_states = text_encoder(batch[0][1].long())[0]
                         else:
                             encoder_hidden_states = batch[0][1]
                     else:
-                        encoder_hidden_states = text_encoder(batch["input_ids"])[0]
+                        encoder_hidden_states = text_encoder(batch["input_ids"].long())[0]
 
                 # Predict the noise residual
                 noise_pred = unet(noisy_latents, timesteps, encoder_hidden_states).sample
