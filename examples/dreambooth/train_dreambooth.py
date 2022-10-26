@@ -719,7 +719,7 @@ def main():
                         if args.train_text_encoder
                         else unet.parameters()
                     )
-                    accelerator.clip_grad_norm_(params_to_clip, args.max_grad_norm, error_if_nonfinite=True)
+                    accelerator.clip_grad_norm_(params_to_clip, args.max_grad_norm)
                 if not math.isnan(loss.item()):
                     optimizer.step()
                     optimizer.zero_grad(set_to_none=True)
