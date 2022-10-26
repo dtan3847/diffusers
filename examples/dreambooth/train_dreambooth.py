@@ -248,6 +248,7 @@ def parse_args():
         default=None,
         help="Path to json containing multiple concepts, will overwrite parameters like instance_prompt, class_prompt, etc.",
     )
+    parser.add_argument("--use_penultimate", action="store_true", help="Use penultimate hidden layer of text encoder output instead of the final layer")
 
     args = parser.parse_args()
     env_local_rank = int(os.environ.get("LOCAL_RANK", -1))
@@ -400,6 +401,26 @@ def get_full_repo_name(model_id: str, organization: Optional[str] = None, token:
     else:
         return f"{organization}/{model_id}"
 
+def encode_tokens_limited(text_encoder: CLIPTextModel, input_ids: torch.Tensor, use_penultimate: bool = True):
+    if use_penultimate:
+        hidden_state = text_encoder(input_ids, return_dict=True, return_hidden_states=True).hidden_states[-2]
+        return text_encoder.text_model.final_layer_norm(hidden_state)
+    else:
+        return text_encoder(input_ids)[0]
+
+# Bypass CLIP input limit by running multiple batches and concatenating
+# Format of input_ids is beginning-of-string token, up to 75 tokens, end-of-string token, for 77 max
+def encode_tokens(text_encoder: CLIPTextModel, input_ids: torch.Tensor, use_penultimate: bool = True):
+    if len(input_ids > 77):
+        bos, ids, eos = torch.split(input_ids, [1, input_ids.length-2, 1])
+        batches = torch.split(ids, 75)
+        out = encode_tokens_limited(text_encoder, torch.cat((bos, batches[0], eos)), use_penultimate=use_penultimate)
+        for batch in batches[1:]:
+            next_out = encode_tokens_limited(text_encoder, torch.cat((bos, batch, eos)), use_penultimate=use_penultimate)
+            torch.cat((out, next_out), axis=-2)
+    else:
+        out = encode_tokens_limited(text_encoder, input_ids, use_penultimate=use_penultimate)
+    return out
 
 def main():
     args = parse_args()
@@ -594,13 +615,14 @@ def main():
                 if args.train_text_encoder:
                     text_encoder_cache.append(batch["input_ids"])
                 else:
-                    text_encoder_cache.append(text_encoder(batch["input_ids"])[0])
+                    text_encoder_cache.append(encode_tokens(text_encoder, batch["input_ids"], args.use_penultimate))
         with torch.no_grad():
             input_ids = tokenizer("", padding="do_not_pad", truncation=True, max_length=tokenizer.model_max_length).input_ids
             padded = tokenizer.pad({"input_ids": [input_ids]}, padding=True, return_tensors="pt").input_ids
             if not args.train_text_encoder:
                 text_encoder.to(accelerator.device, dtype=weight_dtype)
-                empty_latent = text_encoder(padded.to(accelerator.device))[0]
+                padded.to(accelerator.device)
+                empty_latent = encode_tokens(text_encoder, batch["input_ids"], args.use_penultimate)
                 text_encoder.cpu()
             else:
                 # Use token ids list as empty latent
@@ -747,11 +769,11 @@ def main():
                 with text_enc_context:
                     if not args.not_cache_latents:
                         if args.train_text_encoder:
-                            encoder_hidden_states = text_encoder(batch[0][1].long())[0]
+                            encoder_hidden_states = encode_tokens(text_encoder, batch[0][1].long(), args.use_penultimate)
                         else:
                             encoder_hidden_states = batch[0][1]
                     else:
-                        encoder_hidden_states = text_encoder(batch["input_ids"].long())[0]
+                        encoder_hidden_states = encode_tokens(text_encoder, batch["input_ids"].long(), args.use_penultimate)
 
                 # Predict the noise residual
                 noise_pred = unet(noisy_latents, timesteps, encoder_hidden_states).sample
