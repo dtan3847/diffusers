@@ -280,6 +280,10 @@ class DreamBoothDataset(Dataset):
 
         self.instance_images_path = []
 
+        for concept in concepts_list:
+            inst_img_path = [(x, concept["instance_prompt"]) for x in Path(concept["instance_data_dir"]).iterdir() if x.is_file()]
+            self.instance_images_path.extend(inst_img_path)
+
         random.shuffle(self.instance_images_path)
         self.num_instance_images = len(self.instance_images_path)
         self._length = self.num_instance_images
@@ -290,7 +294,7 @@ class DreamBoothDataset(Dataset):
             self.filename_to_prompt = {}
             with open(prompt_file_path) as f:
                 for line in f:
-                    if not line:
+                    if not line.strip():
                         continue
                     name, tag_str = line.strip().split(":")
                     tags = [t.strip() for t in tag_str.split(",")]
@@ -319,14 +323,14 @@ class DreamBoothDataset(Dataset):
         image_path = self.instance_images_path[index % self.num_instance_images]
 
         example["image_path"] = image_path
-        prompt = self.instance_prompt
+        prompt = image_path[1]
         if self.filename_to_prompt:
-            name = os.path.basename(image_path)
+            name = os.path.basename(image_path[0])
             # Use same caption for flipped images
             if name in self.filename_to_prompt:
                 prompt = self.filename_to_prompt[name]
 
-        instance_image = Image.open(image_path)
+        instance_image = Image.open(image_path[0])
         if not instance_image.mode == "RGB":
             instance_image = instance_image.convert("RGB")
         example["instance_images"] = self.image_transforms(instance_image)
@@ -403,7 +407,7 @@ def get_full_repo_name(model_id: str, organization: Optional[str] = None, token:
 
 def encode_tokens_limited(text_encoder: CLIPTextModel, input_ids: torch.Tensor, use_penultimate: bool = True):
     if use_penultimate:
-        hidden_state = text_encoder(input_ids, return_dict=True, return_hidden_states=True).hidden_states[-2]
+        hidden_state = text_encoder(input_ids, return_dict=True, output_hidden_states=True).hidden_states[-2]
         return text_encoder.text_model.final_layer_norm(hidden_state)
     else:
         return text_encoder(input_ids)[0]
@@ -411,11 +415,15 @@ def encode_tokens_limited(text_encoder: CLIPTextModel, input_ids: torch.Tensor, 
 # Bypass CLIP input limit by running multiple batches and concatenating
 # Format of input_ids is beginning-of-string token, up to 75 tokens, end-of-string token, for 77 max
 def encode_tokens(text_encoder: CLIPTextModel, input_ids: torch.Tensor, use_penultimate: bool = True):
-    if len(input_ids > 77):
-        bos, ids, eos = torch.split(input_ids, [1, input_ids.length-2, 1])
+    if len(input_ids) > 77:
+        logger.warning(f"input_ids len: {len(input_ids)}")
+        bos, ids, eos = torch.split(input_ids, [1, len(input_ids)-2, 1])
         batches = torch.split(ids, 75)
         out = encode_tokens_limited(text_encoder, torch.cat((bos, batches[0], eos)), use_penultimate=use_penultimate)
         for batch in batches[1:]:
+            # Randomly dropout tags
+            if random.random() < 0.5:
+                break
             next_out = encode_tokens_limited(text_encoder, torch.cat((bos, batch, eos)), use_penultimate=use_penultimate)
             torch.cat((out, next_out), axis=-2)
     else:
