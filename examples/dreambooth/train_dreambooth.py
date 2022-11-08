@@ -241,7 +241,7 @@ def parse_args():
     )
     parser.add_argument("--not_cache_latents", action="store_true", help="Do not precompute and cache latents from VAE.")
     parser.add_argument("--local_rank", type=int, default=-1, help="For distributed training: local_rank")
-    parser.add_argument("--no_prompt_chance", type=float, default=0, help="Chance for empty prompt to be used during training")
+    parser.add_argument("--prompt_dropout", type=float, default=0.2, help="Chance for empty prompt to be used during training")
     parser.add_argument(
         "--concepts_list",
         type=str,
@@ -322,7 +322,7 @@ class DreamBoothDataset(Dataset):
         example = {}
         image_path = self.instance_images_path[index % self.num_instance_images]
 
-        example["image_path"] = image_path
+        example["image_path"] = os.path.basename(image_path[0])
         prompt = image_path[1]
         if self.filename_to_prompt:
             name = os.path.basename(image_path[0])
@@ -362,12 +362,12 @@ class PromptDataset(Dataset):
 
 
 class LatentsDataset(Dataset):
-    def __init__(self, latents_cache, text_encoder_cache, empty_latent=None, no_prompt_chance=0, paths=None):
+    def __init__(self, latents_cache, text_encoder_cache, empty_latent=None, prompt_dropout=0, paths=None):
         self.latents_cache = latents_cache
         self.text_encoder_cache = text_encoder_cache
-        if no_prompt_chance > 0 and empty_latent is None:
-            raise ValueError("empty_latent must exist if no_prompt_chance is greater than 0")
-        self.no_prompt_chance = no_prompt_chance
+        if prompt_dropout > 0 and empty_latent is None:
+            raise ValueError("empty_latent must exist if prompt_dropout is greater than 0")
+        self.prompt_dropout = prompt_dropout
         self.empty_latent = empty_latent
         self.paths = paths
         logger.warning("# paths: %s", len(paths))
@@ -377,7 +377,7 @@ class LatentsDataset(Dataset):
 
     def __getitem__(self, index):
         text_latent = self.text_encoder_cache[index]
-        if random.random() < self.no_prompt_chance:
+        if random.random() < self.prompt_dropout:
             text_latent = self.empty_latent
         return self.latents_cache[index], text_latent, self.paths[index] if self.paths else None
 
@@ -422,8 +422,6 @@ def encode_tokens(text_encoder: CLIPTextModel, input_ids: torch.Tensor, use_penu
         out = encode_tokens_limited(text_encoder, torch.cat((bos, batches[0], eos)), use_penultimate=use_penultimate)
         for batch in batches[1:]:
             # Randomly dropout tags
-            if random.random() < 0.5:
-                break
             next_out = encode_tokens_limited(text_encoder, torch.cat((bos, batch, eos)), use_penultimate=use_penultimate)
             torch.cat((out, next_out), axis=-2)
     else:
@@ -594,7 +592,7 @@ def main():
         return batch
 
     train_dataloader = torch.utils.data.DataLoader(
-        train_dataset, batch_size=args.train_batch_size, shuffle=True, collate_fn=collate_fn, pin_memory=True
+        train_dataset, batch_size=args.train_batch_size, shuffle=True, collate_fn=collate_fn
     )
 
     weight_dtype = torch.float32
@@ -636,7 +634,7 @@ def main():
                 # Use token ids list as empty latent
                 empty_latent = padded
 
-        train_dataset = LatentsDataset(latents_cache, text_encoder_cache, empty_latent=empty_latent, no_prompt_chance=args.no_prompt_chance, paths=paths)
+        train_dataset = LatentsDataset(latents_cache, text_encoder_cache, empty_latent=empty_latent, prompt_dropout=args.prompt_dropout, paths=paths)
         train_dataloader = torch.utils.data.DataLoader(train_dataset, batch_size=1, collate_fn=lambda x: x, shuffle=True)
 
         del vae
