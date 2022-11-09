@@ -6,7 +6,6 @@ import random
 import json
 import math
 import os
-import random
 from contextlib import nullcontext
 from pathlib import Path
 from typing import Optional
@@ -254,7 +253,6 @@ class DreamBoothDataset(Dataset):
             inst_img_path = [(x, concept["instance_prompt"]) for x in Path(concept["instance_data_dir"]).iterdir() if x.is_file()]
             self.instance_images_path.extend(inst_img_path)
 
-        random.shuffle(self.instance_images_path)
         self.num_instance_images = len(self.instance_images_path)
         self._length = self.num_instance_images
 
@@ -267,9 +265,7 @@ class DreamBoothDataset(Dataset):
                     if not line.strip():
                         continue
                     name, tag_str = line.strip().split(":")
-                    tags = [t.strip() for t in tag_str.split(",")]
-                    random.shuffle(tags)
-                    self.filename_to_prompt[name.strip()] = ",".join(tags)
+                    self.filename_to_prompt[name.strip()] = tag_str
         else:
             self.filename_to_prompt = None
 
@@ -279,7 +275,6 @@ class DreamBoothDataset(Dataset):
             [
                 # transforms.Resize(size, interpolation=transforms.InterpolationMode.BILINEAR),
                 # transforms.CenterCrop(size) if center_crop else transforms.RandomCrop(size),
-                transforms.RandomHorizontalFlip(0.5),
                 transforms.ToTensor(),
                 transforms.Normalize([0.5], [0.5]),
             ]
@@ -303,6 +298,8 @@ class DreamBoothDataset(Dataset):
         instance_image = Image.open(image_path[0])
         if not instance_image.mode == "RGB":
             instance_image = instance_image.convert("RGB")
+        if (torch.rand(1) > .5):
+            instance_image = F.hflip(instance_image)
         example["instance_images"] = self.image_transforms(instance_image)
         example["prompt"] = prompt
 
@@ -327,8 +324,9 @@ class PromptDataset(Dataset):
 
 
 class LatentsDataset(Dataset):
-    def __init__(self, latents_cache, text_encoder_cache, paths=None):
+    def __init__(self, latents_cache, latents_cache_f, text_encoder_cache, paths=None):
         self.latents_cache = latents_cache
+        self.latents_cache_f = latents_cache_f
         self.text_encoder_cache = text_encoder_cache
         self.paths = paths
         logger.warning("# paths: %s", len(paths))
@@ -337,8 +335,12 @@ class LatentsDataset(Dataset):
         return len(self.latents_cache)
 
     def __getitem__(self, index):
+        if (torch.rand(1) > .5):
+            image_latent = self.latents_cache_f[index]
+        else:
+            image_latent = self.latents_cache[index]
         text_latent = self.text_encoder_cache[index]
-        return self.latents_cache[index], text_latent, self.paths[index] if self.paths else None
+        return image_latent, text_latent, self.paths[index] if self.paths else None
 
 
 class AverageMeter:
@@ -485,7 +487,7 @@ def main():
         tags = [t.strip() for t in prompt.split(",")]
         random.shuffle(tags)
         for i in range(len(tags)):
-            if random.random() >= per_tag_chance:
+            if  torch.rand(1) >= per_tag_chance:
                 break
         return tags[:i]
 
@@ -533,6 +535,7 @@ def main():
 
     if not args.not_cache_latents:
         latents_cache = []
+        latents_cache_f = []
         text_encoder_cache = []
         paths = []
         for batch in tqdm(train_dataloader, desc="Caching latents"):
@@ -540,13 +543,14 @@ def main():
                 batch["pixel_values"] = batch["pixel_values"].to(accelerator.device, non_blocking=True, dtype=weight_dtype)
                 
                 latents_cache.append(vae.encode(batch["pixel_values"]).latent_dist)
+                latents_cache_f.append(vae.encode(F.hflip(batch["pixel_values"])).latent_dist)
                 paths += batch["paths"]
                 if args.train_text_encoder:
                     text_encoder_cache.append(batch["prompts"])
                 else:
                     text_encoder_cache.append(prompts_to_tokens(batch["prompts"]))
 
-        train_dataset = LatentsDataset(latents_cache, text_encoder_cache, paths=paths)
+        train_dataset = LatentsDataset(latents_cache, latents_cache_f, text_encoder_cache, paths=paths)
         train_dataloader = torch.utils.data.DataLoader(train_dataset, batch_size=1, collate_fn=lambda x: x, shuffle=True)
 
         del vae
