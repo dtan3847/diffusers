@@ -62,12 +62,6 @@ def parse_args():
         help="A folder containing the training data of instance images.",
     )
     parser.add_argument(
-        "--class_data_dir",
-        type=str,
-        default=None,
-        help="A folder containing the training data of class images.",
-    )
-    parser.add_argument(
         "--instance_prompt",
         type=str,
         default=None,
@@ -79,12 +73,6 @@ def parse_args():
         default=None,
         required=False,
         help="The path of a file with filename-prompt pairs",
-    )
-    parser.add_argument(
-        "--class_prompt",
-        type=str,
-        default=None,
-        help="The prompt to specify images in the same class as provided instance images.",
     )
     parser.add_argument(
         "--save_sample_prompt",
@@ -115,22 +103,6 @@ def parse_args():
         type=int,
         default=50,
         help="The number of inference steps for save sample.",
-    )
-    parser.add_argument(
-        "--with_prior_preservation",
-        default=False,
-        action="store_true",
-        help="Flag to add prior preservation loss.",
-    )
-    parser.add_argument("--prior_loss_weight", type=float, default=1.0, help="The weight of prior preservation loss.")
-    parser.add_argument(
-        "--num_class_images",
-        type=int,
-        default=100,
-        help=(
-            "Minimal class images for prior preservation loss. If not have enough images, additional images will be"
-            " sampled with class_prompt."
-        ),
     )
     parser.add_argument(
         "--output_dir",
@@ -241,7 +213,7 @@ def parse_args():
     )
     parser.add_argument("--not_cache_latents", action="store_true", help="Do not precompute and cache latents from VAE.")
     parser.add_argument("--local_rank", type=int, default=-1, help="For distributed training: local_rank")
-    parser.add_argument("--prompt_dropout", type=float, default=0.2, help="Chance for empty prompt to be used during training")
+    parser.add_argument("--tag_dropout", type=float, default=0.95, help="Chance for remaining tags to be kept, for each tag")
     parser.add_argument(
         "--concepts_list",
         type=str,
@@ -268,7 +240,6 @@ class DreamBoothDataset(Dataset):
         self,
         concepts_list,
         tokenizer,
-        with_prior_preservation=True,
         size=512,
         center_crop=False,
         prompt_file_path=None,
@@ -276,7 +247,6 @@ class DreamBoothDataset(Dataset):
         self.size = size
         self.center_crop = center_crop
         self.tokenizer = tokenizer
-        self.with_prior_preservation = with_prior_preservation
 
         self.instance_images_path = []
 
@@ -334,12 +304,7 @@ class DreamBoothDataset(Dataset):
         if not instance_image.mode == "RGB":
             instance_image = instance_image.convert("RGB")
         example["instance_images"] = self.image_transforms(instance_image)
-        example["instance_prompt_ids"] = self.tokenizer(
-            prompt,
-            padding="do_not_pad",
-            truncation=True,
-            max_length=self.tokenizer.model_max_length,
-        ).input_ids
+        example["prompt"] = prompt
 
         return example
 
@@ -362,13 +327,9 @@ class PromptDataset(Dataset):
 
 
 class LatentsDataset(Dataset):
-    def __init__(self, latents_cache, text_encoder_cache, empty_latent=None, prompt_dropout=0, paths=None):
+    def __init__(self, latents_cache, text_encoder_cache, paths=None):
         self.latents_cache = latents_cache
         self.text_encoder_cache = text_encoder_cache
-        if prompt_dropout > 0 and empty_latent is None:
-            raise ValueError("empty_latent must exist if prompt_dropout is greater than 0")
-        self.prompt_dropout = prompt_dropout
-        self.empty_latent = empty_latent
         self.paths = paths
         logger.warning("# paths: %s", len(paths))
 
@@ -377,8 +338,6 @@ class LatentsDataset(Dataset):
 
     def __getitem__(self, index):
         text_latent = self.text_encoder_cache[index]
-        if random.random() < self.prompt_dropout:
-            text_latent = self.empty_latent
         return self.latents_cache[index], text_latent, self.paths[index] if self.paths else None
 
 
@@ -421,7 +380,6 @@ def encode_tokens(text_encoder: CLIPTextModel, input_ids: torch.Tensor, use_penu
         batches = torch.split(ids, 75)
         out = encode_tokens_limited(text_encoder, torch.cat((bos, batches[0], eos)), use_penultimate=use_penultimate)
         for batch in batches[1:]:
-            # Randomly dropout tags
             next_out = encode_tokens_limited(text_encoder, torch.cat((bos, batch, eos)), use_penultimate=use_penultimate)
             torch.cat((out, next_out), axis=-2)
     else:
@@ -455,56 +413,12 @@ def main():
         args.concepts_list = [
             {
                 "instance_prompt": args.instance_prompt,
-                "class_prompt": args.class_prompt,
                 "instance_data_dir": args.instance_data_dir,
-                "class_data_dir": args.class_data_dir
             }
         ]
     else:
         with open(args.concepts_list, "r") as f:
             args.concepts_list = json.load(f)
-
-    if args.with_prior_preservation:
-        pipeline = None
-        for concept in args.concepts_list:
-            class_images_dir = Path(concept["class_data_dir"])
-            class_images_dir.mkdir(parents=True, exist_ok=True)
-            cur_class_images = len(list(class_images_dir.iterdir()))
-
-            if cur_class_images < args.num_class_images:
-                torch_dtype = torch.float16 if accelerator.device.type == "cuda" else torch.float32
-                if pipeline is None:
-                    pipeline = StableDiffusionPipeline.from_pretrained(
-                        args.pretrained_model_name_or_path,
-                        vae=AutoencoderKL.from_pretrained(args.pretrained_vae_name_or_path or args.pretrained_model_name_or_path),
-                        torch_dtype=torch_dtype,
-                        safety_checker=None,
-                    )
-                    pipeline.set_progress_bar_config(disable=True)
-                    pipeline.to(accelerator.device)
-
-                num_new_images = args.num_class_images - cur_class_images
-                logger.info(f"Number of class images to sample: {num_new_images}.")
-
-                sample_dataset = PromptDataset(concept["class_prompt"], num_new_images)
-                sample_dataloader = torch.utils.data.DataLoader(sample_dataset, batch_size=args.sample_batch_size)
-
-                sample_dataloader = accelerator.prepare(sample_dataloader)
-
-                with torch.autocast("cuda"), torch.inference_mode():
-                    for example in tqdm(
-                        sample_dataloader, desc="Generating class images", disable=not accelerator.is_local_main_process
-                    ):
-                        images = pipeline(example["prompt"]).images
-
-                        for i, image in enumerate(images):
-                            hash_image = hashlib.sha1(image.tobytes()).hexdigest()
-                            image_filename = class_images_dir / f"{example['index'][i] + cur_class_images}-{hash_image}.jpg"
-                            image.save(image_filename)
-
-        del pipeline
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
 
     # Load the tokenizer
     if args.tokenizer_name:
@@ -562,34 +476,43 @@ def main():
     train_dataset = DreamBoothDataset(
         concepts_list=args.concepts_list,
         tokenizer=tokenizer,
-        with_prior_preservation=args.with_prior_preservation,
         size=args.resolution,
         center_crop=args.center_crop,
         prompt_file_path=args.prompt_file_path,
     )
 
+    def dropout_tags(prompt, per_tag_chance=args.tag_dropout):
+        tags = [t.strip() for t in prompt.split(",")]
+        random.shuffle(tags)
+        for i in range(len(tags)):
+            if random.random() >= per_tag_chance:
+                break
+        return tags[:i]
+
     def collate_fn(examples):
-        input_ids = [example["instance_prompt_ids"] for example in examples]
         pixel_values = [example["instance_images"] for example in examples]
         paths = [example["image_path"] for example in examples]
-
-        # Concat class and instance examples for prior preservation.
-        # We do this to avoid doing two forward passes.
-        if args.with_prior_preservation:
-            input_ids += [example["class_prompt_ids"] for example in examples]
-            pixel_values += [example["class_images"] for example in examples]
 
         pixel_values = torch.stack(pixel_values)
         pixel_values = pixel_values.to(memory_format=torch.contiguous_format).float()
 
-        input_ids = tokenizer.pad({"input_ids": input_ids}, padding=True, return_tensors="pt").input_ids
+        prompts = [example["prompt"] for example in examples]
 
         batch = {
-            "input_ids": input_ids,
+            "prompts": prompts,
             "pixel_values": pixel_values,
             "paths": paths,
         }
         return batch
+    
+    def prompts_to_tokens(prompts):
+        input_ids = tokenizer(
+                [dropout_tags(p) for p in prompts],
+                padding=True,
+                truncation=False,
+                return_tensors="pt"
+            ).input_ids.to(accelerator.device, non_blocking=True)
+        return encode_tokens(text_encoder, input_ids.long(), args.use_penultimate)
 
     train_dataloader = torch.utils.data.DataLoader(
         train_dataset, batch_size=args.train_batch_size, shuffle=True, collate_fn=collate_fn
@@ -615,26 +538,15 @@ def main():
         for batch in tqdm(train_dataloader, desc="Caching latents"):
             with torch.no_grad():
                 batch["pixel_values"] = batch["pixel_values"].to(accelerator.device, non_blocking=True, dtype=weight_dtype)
-                batch["input_ids"] = batch["input_ids"].to(accelerator.device, non_blocking=True)
+                
                 latents_cache.append(vae.encode(batch["pixel_values"]).latent_dist)
                 paths += batch["paths"]
                 if args.train_text_encoder:
-                    text_encoder_cache.append(batch["input_ids"])
+                    text_encoder_cache.append(batch["prompts"])
                 else:
-                    text_encoder_cache.append(encode_tokens(text_encoder, batch["input_ids"], args.use_penultimate))
-        with torch.no_grad():
-            input_ids = tokenizer("", padding="do_not_pad", truncation=True, max_length=tokenizer.model_max_length).input_ids
-            padded = tokenizer.pad({"input_ids": [input_ids]}, padding=True, return_tensors="pt").input_ids
-            if not args.train_text_encoder:
-                text_encoder.to(accelerator.device, dtype=weight_dtype)
-                padded.to(accelerator.device)
-                empty_latent = encode_tokens(text_encoder, batch["input_ids"], args.use_penultimate)
-                text_encoder.cpu()
-            else:
-                # Use token ids list as empty latent
-                empty_latent = padded
+                    text_encoder_cache.append(prompts_to_tokens(batch["prompts"]))
 
-        train_dataset = LatentsDataset(latents_cache, text_encoder_cache, empty_latent=empty_latent, prompt_dropout=args.prompt_dropout, paths=paths)
+        train_dataset = LatentsDataset(latents_cache, text_encoder_cache, paths=paths)
         train_dataloader = torch.utils.data.DataLoader(train_dataset, batch_size=1, collate_fn=lambda x: x, shuffle=True)
 
         del vae
@@ -775,30 +687,16 @@ def main():
                 with text_enc_context:
                     if not args.not_cache_latents:
                         if args.train_text_encoder:
-                            encoder_hidden_states = encode_tokens(text_encoder, batch[0][1].long(), args.use_penultimate)
+                            encoder_hidden_states = prompts_to_tokens(batch[0][1])
                         else:
                             encoder_hidden_states = batch[0][1]
                     else:
-                        encoder_hidden_states = encode_tokens(text_encoder, batch["input_ids"].long(), args.use_penultimate)
+                        encoder_hidden_states = prompts_to_tokens(batch["prompts"])
 
                 # Predict the noise residual
                 noise_pred = unet(noisy_latents, timesteps, encoder_hidden_states).sample
 
-                if args.with_prior_preservation:
-                    # Chunk the noise and noise_pred into two parts and compute the loss on each part separately.
-                    noise_pred, noise_pred_prior = torch.chunk(noise_pred, 2, dim=0)
-                    noise, noise_prior = torch.chunk(noise, 2, dim=0)
-
-                    # Compute instance loss
-                    loss = F.mse_loss(noise_pred.float(), noise.float(), reduction="none").mean([1, 2, 3]).mean()
-
-                    # Compute prior loss
-                    prior_loss = F.mse_loss(noise_pred_prior.float(), noise_prior.float(), reduction="mean")
-
-                    # Add the prior loss to the instance loss.
-                    loss = loss + args.prior_loss_weight * prior_loss
-                else:
-                    loss = F.mse_loss(noise_pred.float(), noise.float(), reduction="mean")
+                loss = F.mse_loss(noise_pred.float(), noise.float(), reduction="mean")
 
                 accelerator.backward(loss)
                 if accelerator.sync_gradients:
