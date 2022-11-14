@@ -23,6 +23,7 @@ from diffusers.optimization import get_scheduler
 from huggingface_hub import HfFolder, Repository, whoami
 from PIL import Image
 from torchvision import transforms
+from torchvision.transforms.functional import hflip
 from tqdm.auto import tqdm
 from transformers import CLIPTextModel, CLIPTokenizer
 
@@ -102,6 +103,18 @@ def parse_args():
         type=int,
         default=50,
         help="The number of inference steps for save sample.",
+    )
+    parser.add_argument(
+        "--save_width",
+        type=int,
+        default=512,
+        help="The width for save sample.",
+    )
+    parser.add_argument(
+        "--save_height",
+        type=int,
+        default=512,
+        help="The height for save sample.",
     )
     parser.add_argument(
         "--output_dir",
@@ -299,7 +312,7 @@ class DreamBoothDataset(Dataset):
         if not instance_image.mode == "RGB":
             instance_image = instance_image.convert("RGB")
         if (torch.rand(1) > .5):
-            instance_image = F.hflip(instance_image)
+            instance_image = hflip(instance_image)
         example["instance_images"] = self.image_transforms(instance_image)
         example["prompt"] = prompt
 
@@ -375,14 +388,16 @@ def encode_tokens_limited(text_encoder: CLIPTextModel, input_ids: torch.Tensor, 
 
 # Bypass CLIP input limit by running multiple batches and concatenating
 # Format of input_ids is beginning-of-string token, up to 75 tokens, end-of-string token, for 77 max
+# todo fix batches?
 def encode_tokens(text_encoder: CLIPTextModel, input_ids: torch.Tensor, use_penultimate: bool = True):
-    if len(input_ids) > 77:
-        logger.warning(f"input_ids len: {len(input_ids)}")
-        bos, ids, eos = torch.split(input_ids, [1, len(input_ids)-2, 1])
+    first = input_ids[0]
+    if len(first) > 77:
+        bos, ids, eos = torch.split(first, [1, len(first)-2, 1])
         batches = torch.split(ids, 75)
-        out = encode_tokens_limited(text_encoder, torch.cat((bos, batches[0], eos)), use_penultimate=use_penultimate)
+        first = torch.unsqueeze(torch.cat((bos, batches[0], eos)), 0)
+        out = encode_tokens_limited(text_encoder, first, use_penultimate=use_penultimate)
         for batch in batches[1:]:
-            next_out = encode_tokens_limited(text_encoder, torch.cat((bos, batch, eos)), use_penultimate=use_penultimate)
+            next_out = encode_tokens_limited(text_encoder, torch.unsqueeze(torch.cat((bos, batch, eos)), 0), use_penultimate=use_penultimate)
             torch.cat((out, next_out), axis=-2)
     else:
         out = encode_tokens_limited(text_encoder, input_ids, use_penultimate=use_penultimate)
@@ -489,7 +504,7 @@ def main():
         for i in range(len(tags)):
             if  torch.rand(1) >= per_tag_chance:
                 break
-        return tags[:i]
+        return ",".join(tags[:i])
 
     def collate_fn(examples):
         pixel_values = [example["instance_images"] for example in examples]
@@ -508,13 +523,17 @@ def main():
         return batch
     
     def prompts_to_tokens(prompts):
+        #logger.warning(prompts)
+        prompts = [dropout_tags(p) for p in prompts]
         input_ids = tokenizer(
-                [dropout_tags(p) for p in prompts],
+                prompts,
                 padding=True,
                 truncation=False,
                 return_tensors="pt"
             ).input_ids.to(accelerator.device, non_blocking=True)
-        return encode_tokens(text_encoder, input_ids.long(), args.use_penultimate)
+        #logger.warning(prompts)
+        out = encode_tokens(text_encoder, input_ids.long(), args.use_penultimate)
+        return out
 
     train_dataloader = torch.utils.data.DataLoader(
         train_dataset, batch_size=args.train_batch_size, shuffle=True, collate_fn=collate_fn
@@ -543,7 +562,7 @@ def main():
                 batch["pixel_values"] = batch["pixel_values"].to(accelerator.device, non_blocking=True, dtype=weight_dtype)
                 
                 latents_cache.append(vae.encode(batch["pixel_values"]).latent_dist)
-                latents_cache_f.append(vae.encode(F.hflip(batch["pixel_values"])).latent_dist)
+                latents_cache_f.append(vae.encode(hflip(batch["pixel_values"])).latent_dist)
                 paths += batch["paths"]
                 if args.train_text_encoder:
                     text_encoder_cache.append(batch["prompts"])
@@ -646,12 +665,26 @@ def main():
                     for i in tqdm(range(args.n_save_sample), desc="Generating samples"):
                         images = pipeline(
                             args.save_sample_prompt,
+                            width=args.save_width,
+                            height=args.save_height,
                             negative_prompt=args.save_sample_negative_prompt,
                             guidance_scale=args.save_guidance_scale,
                             num_inference_steps=args.save_infer_steps,
                             generator=g_cuda
                         ).images
                         images[0].save(os.path.join(sample_dir, f"{i}.png"))
+                    g_cuda.seed()
+                    for i in tqdm(range(args.n_save_sample), desc="Generating random samples"):
+                        images = pipeline(
+                            args.save_sample_prompt,
+                            width=args.save_width,
+                            height=args.save_height,
+                            negative_prompt=args.save_sample_negative_prompt,
+                            guidance_scale=args.save_guidance_scale,
+                            num_inference_steps=args.save_infer_steps,
+                            generator=g_cuda
+                        ).images
+                        images[0].save(os.path.join(sample_dir, f"rand-{i}.png"))
                 del pipeline
                 if torch.cuda.is_available():
                     torch.cuda.empty_cache()
