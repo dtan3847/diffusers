@@ -185,6 +185,9 @@ def parse_args():
         "--lr_warmup_steps", type=int, default=500, help="Number of steps for the warmup in the lr scheduler."
     )
     parser.add_argument(
+        "--lr_last_step", type=int, default=-1, help="Number of steps already computed."
+    )
+    parser.add_argument(
         "--use_8bit_adam", action="store_true", help="Whether or not to use 8-bit Adam from bitsandbytes."
     )
     parser.add_argument("--adam_beta1", type=float, default=0.9, help="The beta1 parameter for the Adam optimizer.")
@@ -293,6 +296,13 @@ class DreamBoothDataset(Dataset):
             ]
         )
 
+    def _get_random_crop_box(self, im, multiple_of=64):
+        new_w = im.width // multiple_of * multiple_of
+        new_h = im.height // multiple_of * multiple_of
+        dw = random.choice(range(0, im.width - new_w + 1))
+        dh = random.choice(range(0, im.height - new_h + 1))
+        return dw, dh, new_w - dw, new_h - dh
+
     def __len__(self):
         return self._length
 
@@ -308,9 +318,8 @@ class DreamBoothDataset(Dataset):
             if name in self.filename_to_prompt:
                 prompt = self.filename_to_prompt[name]
 
-        instance_image = Image.open(image_path[0])
-        if not instance_image.mode == "RGB":
-            instance_image = instance_image.convert("RGB")
+        instance_image = Image.open(image_path[0]).convert("RGB")
+        instance_image = instance_image.crop(self._get_random_crop_box(instance_image))
         if (torch.rand(1) > .5):
             instance_image = hflip(instance_image)
         example["instance_images"] = self.image_transforms(instance_image)
@@ -337,21 +346,67 @@ class PromptDataset(Dataset):
 
 
 class LatentsDataset(Dataset):
-    def __init__(self, latents_cache, latents_cache_f, text_encoder_cache, paths=None):
-        self.latents_cache = latents_cache
-        self.latents_cache_f = latents_cache_f
-        self.text_encoder_cache = text_encoder_cache
-        self.paths = paths
-        logger.warning("# paths: %s", len(paths))
+    def __init__(self, vae, text_encoder, tokenizer, accelerator, weight_dtype, 
+            source_dataloader, args):
+        self.vae = vae
+        self.text_encoder = text_encoder
+        self.tokenizer = tokenizer
+        self.accelerator = accelerator
+        self.weight_dtype = weight_dtype
+        self.source_dataloader = source_dataloader
+        self.args = args
+
+    def cache_latents(self):
+        # Move text_encode and vae to gpu.
+        # For mixed precision training we cast the text_encoder and vae weights to half-precision
+        # as these models are only used for inference, keeping weights in full precision is not required.
+        self.vae.to(self.accelerator.device, dtype=self.weight_dtype)
+        if not self.args.train_text_encoder:
+            self.text_encoder.to(self.accelerator.device, dtype=self.weight_dtype)
+
+        self.latents_cache = []
+        self.text_encoder_cache = []
+        self.paths = []
+        for batch in tqdm(self.source_dataloader, desc="Caching latents"):
+            with torch.no_grad():
+                batch["pixel_values"] = batch["pixel_values"].to(self.accelerator.device, non_blocking=True, dtype=self.weight_dtype)
+                
+                self.latents_cache.append(self.vae.encode(batch["pixel_values"]).latent_dist)
+                self.paths += batch["paths"]
+                if self.args.train_text_encoder:
+                    self.text_encoder_cache.append(batch["prompts"])
+                else:
+                    self.text_encoder_cache.append(self._prompts_to_tokens(batch["prompts"]).cpu())
+        self.vae.cpu()
+        if not self.args.train_text_encoder:
+            self.text_encoder.cpu()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+    def _prompts_to_tokens(self, prompts):
+        prompts = [self._dropout_tags(p, per_tag_chance=self.args.tag_dropout) for p in prompts]
+        input_ids = self.tokenizer(
+                prompts,
+                padding=True,
+                truncation=False,
+                return_tensors="pt"
+            ).input_ids.to(self.accelerator.device, non_blocking=True)
+        out = encode_tokens(self.text_encoder, input_ids.long(), self.args.use_penultimate)
+        return out
+
+    def _dropout_tags(self, prompt, per_tag_chance):
+        tags = [t.strip() for t in prompt.split(",")]
+        random.shuffle(tags)
+        for i in range(len(tags)):
+            if  torch.rand(1) >= per_tag_chance:
+                break
+        return ",".join(tags[:i])
 
     def __len__(self):
         return len(self.latents_cache)
 
     def __getitem__(self, index):
-        if (torch.rand(1) > .5):
-            image_latent = self.latents_cache_f[index]
-        else:
-            image_latent = self.latents_cache[index]
+        image_latent = self.latents_cache[index]
         text_latent = self.text_encoder_cache[index]
         return image_latent, text_latent, self.paths[index] if self.paths else None
 
@@ -398,7 +453,7 @@ def encode_tokens(text_encoder: CLIPTextModel, input_ids: torch.Tensor, use_penu
         out = encode_tokens_limited(text_encoder, first, use_penultimate=use_penultimate)
         for batch in batches[1:]:
             next_out = encode_tokens_limited(text_encoder, torch.unsqueeze(torch.cat((bos, batch, eos)), 0), use_penultimate=use_penultimate)
-            torch.cat((out, next_out), axis=-2)
+            out = torch.cat((out, next_out), axis=-2)
     else:
         out = encode_tokens_limited(text_encoder, input_ids, use_penultimate=use_penultimate)
     return out
@@ -505,6 +560,19 @@ def main():
             if  torch.rand(1) >= per_tag_chance:
                 break
         return ",".join(tags[:i])
+    
+    def prompts_to_tokens(prompts):
+        #logger.warning(prompts)
+        prompts = [dropout_tags(p) for p in prompts]
+        input_ids = tokenizer(
+                prompts,
+                padding=True,
+                truncation=False,
+                return_tensors="pt"
+            ).input_ids.to(accelerator.device, non_blocking=True)
+        #logger.warning(prompts)
+        out = encode_tokens(text_encoder, input_ids.long(), args.use_penultimate)
+        return out
 
     def collate_fn(examples):
         pixel_values = [example["instance_images"] for example in examples]
@@ -521,19 +589,6 @@ def main():
             "paths": paths,
         }
         return batch
-    
-    def prompts_to_tokens(prompts):
-        #logger.warning(prompts)
-        prompts = [dropout_tags(p) for p in prompts]
-        input_ids = tokenizer(
-                prompts,
-                padding=True,
-                truncation=False,
-                return_tensors="pt"
-            ).input_ids.to(accelerator.device, non_blocking=True)
-        #logger.warning(prompts)
-        out = encode_tokens(text_encoder, input_ids.long(), args.use_penultimate)
-        return out
 
     train_dataloader = torch.utils.data.DataLoader(
         train_dataset, batch_size=args.train_batch_size, shuffle=True, collate_fn=collate_fn
@@ -545,38 +600,11 @@ def main():
     elif args.mixed_precision == "bf16":
         weight_dtype = torch.bfloat16
 
-    # Move text_encode and vae to gpu.
-    # For mixed precision training we cast the text_encoder and vae weights to half-precision
-    # as these models are only used for inference, keeping weights in full precision is not required.
-    vae.to(accelerator.device, dtype=weight_dtype)
-    if not args.train_text_encoder:
-        text_encoder.to(accelerator.device, dtype=weight_dtype)
 
     if not args.not_cache_latents:
-        latents_cache = []
-        latents_cache_f = []
-        text_encoder_cache = []
-        paths = []
-        for batch in tqdm(train_dataloader, desc="Caching latents"):
-            with torch.no_grad():
-                batch["pixel_values"] = batch["pixel_values"].to(accelerator.device, non_blocking=True, dtype=weight_dtype)
-                
-                latents_cache.append(vae.encode(batch["pixel_values"]).latent_dist)
-                latents_cache_f.append(vae.encode(hflip(batch["pixel_values"])).latent_dist)
-                paths += batch["paths"]
-                if args.train_text_encoder:
-                    text_encoder_cache.append(batch["prompts"])
-                else:
-                    text_encoder_cache.append(prompts_to_tokens(batch["prompts"]))
-
-        train_dataset = LatentsDataset(latents_cache, latents_cache_f, text_encoder_cache, paths=paths)
+        train_dataset = LatentsDataset(vae, text_encoder, tokenizer, accelerator, weight_dtype, source_dataloader=train_dataloader, args=args)
+        train_dataset.cache_latents()
         train_dataloader = torch.utils.data.DataLoader(train_dataset, batch_size=1, collate_fn=lambda x: x, shuffle=True)
-
-        del vae
-        if not args.train_text_encoder:
-            del text_encoder
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
 
     # Scheduler and math around the number of training steps.
     overrode_max_train_steps = False
@@ -587,11 +615,17 @@ def main():
 
 
     if args.lr_scheduler == "onecycle":
+        total_steps = args.max_train_steps
+        if args.lr_last_step > 0:
+            total_steps += args.lr_last_step
         lr_scheduler = torch.optim.lr_scheduler.OneCycleLR(
             optimizer,
             args.learning_rate,
-            total_steps=args.max_train_steps,
+            total_steps=total_steps,
         )
+        if args.lr_last_step > 0:
+            for _ in range(args.lr_last_step):
+                lr_scheduler.step()
     else:
         lr_scheduler = get_scheduler(
             args.lr_scheduler,
@@ -697,79 +731,93 @@ def main():
     loss_avg = AverageMeter()
     loss_heap = []
     text_enc_context = nullcontext() if args.train_text_encoder else torch.no_grad()
-    for epoch in range(args.num_train_epochs):
-        unet.train()
-        for step, batch in enumerate(train_dataloader):
-            with accelerator.accumulate(unet):
-                # Convert images to latent space
-                with torch.no_grad():
-                    if not args.not_cache_latents:
-                        latent_dist = batch[0][0]
-                    else:
-                        latent_dist = vae.encode(batch["pixel_values"].to(dtype=weight_dtype)).latent_dist
-                    latents = latent_dist.sample() * 0.18215
-
-                # Sample noise that we'll add to the latents
-                noise = torch.randn_like(latents)
-                bsz = latents.shape[0]
-                # Sample a random timestep for each image
-                timesteps = torch.randint(0, noise_scheduler.config.num_train_timesteps, (bsz,), device=latents.device)
-                timesteps = timesteps.long()
-
-                # Add noise to the latents according to the noise magnitude at each timestep
-                # (this is the forward diffusion process)
-                noisy_latents = noise_scheduler.add_noise(latents, noise, timesteps)
-
-                # Get the text embedding for conditioning
-                with text_enc_context:
-                    if not args.not_cache_latents:
-                        if args.train_text_encoder:
-                            encoder_hidden_states = prompts_to_tokens(batch[0][1])
+    first_run = True
+    try:
+        for epoch in range(args.num_train_epochs):
+            if not args.not_cache_latents and not first_run:
+                train_dataset.cache_latents()
+            first_run = False
+            unet.train()
+            for step, batch in enumerate(train_dataloader):
+                with accelerator.accumulate(unet):
+                    # Convert images to latent space
+                    with torch.no_grad():
+                        if not args.not_cache_latents:
+                            latent_dist = batch[0][0]
                         else:
-                            encoder_hidden_states = batch[0][1]
+                            latent_dist = vae.encode(batch["pixel_values"].to(dtype=weight_dtype)).latent_dist
+                        latents = latent_dist.sample() * 0.18215
+
+                    # Sample noise that we'll add to the latents
+                    noise = torch.randn_like(latents)
+                    bsz = latents.shape[0]
+                    # Sample a random timestep for each image
+                    timesteps = torch.randint(0, noise_scheduler.config.num_train_timesteps, (bsz,), device=latents.device)
+                    timesteps = timesteps.long()
+
+                    # Add noise to the latents according to the noise magnitude at each timestep
+                    # (this is the forward diffusion process)
+                    noisy_latents = noise_scheduler.add_noise(latents, noise, timesteps)
+
+                    # Get the text embedding for conditioning
+                    with text_enc_context:
+                        if not args.not_cache_latents:
+                            if args.train_text_encoder:
+                                encoder_hidden_states = prompts_to_tokens(batch[0][1])
+                            else:
+                                encoder_hidden_states = batch[0][1]
+                        else:
+                            encoder_hidden_states = prompts_to_tokens(batch["prompts"])
+
+                    # Predict the noise residual
+                    encoder_hidden_states.to(accelerator.device, dtype=weight_dtype)
+                    noise_pred = unet(noisy_latents, timesteps, encoder_hidden_states).sample
+                    encoder_hidden_states.cpu()
+
+                    loss = F.mse_loss(noise_pred.float(), noise.float(), reduction="mean")
+
+                    accelerator.backward(loss)
+                    if accelerator.sync_gradients:
+                        params_to_clip = (
+                            itertools.chain(unet.parameters(), text_encoder.parameters())
+                            if args.train_text_encoder
+                            else unet.parameters()
+                        )
+                        accelerator.clip_grad_norm_(params_to_clip, args.max_grad_norm)
+                    if not math.isnan(loss.item()):
+                        optimizer.step()
+                        optimizer.zero_grad(set_to_none=True)
+                        loss_avg.update(loss.detach_(), bsz)
                     else:
-                        encoder_hidden_states = prompts_to_tokens(batch["prompts"])
+                        logger.warning("nan loss. noise=%s, noise_pred=%s, paths=%s",noise, noise_pred, [str(b[2]) for b in batch])
+                        raise Exception("Nan loss, cannot continue")
+                    lr_scheduler.step()
 
-                # Predict the noise residual
-                noise_pred = unet(noisy_latents, timesteps, encoder_hidden_states).sample
+                if not global_step % args.log_interval:
+                    logs = {"loss": loss.item(), "loss_avg": loss_avg.avg.item(), "lr": lr_scheduler.get_last_lr()[0]}
+                    progress_bar.set_postfix(**logs)
+                    accelerator.log(logs, step=global_step)
 
-                loss = F.mse_loss(noise_pred.float(), noise.float(), reduction="mean")
+                loss_heap.append({"loss": loss.item(), "paths": [str(b[2]) for b in batch]})
+                
+                if global_step > args.save_min_steps and not global_step % args.save_interval:
+                    save_weights(global_step)
 
-                accelerator.backward(loss)
-                if accelerator.sync_gradients:
-                    params_to_clip = (
-                        itertools.chain(unet.parameters(), text_encoder.parameters())
-                        if args.train_text_encoder
-                        else unet.parameters()
-                    )
-                    accelerator.clip_grad_norm_(params_to_clip, args.max_grad_norm)
-                if not math.isnan(loss.item()):
-                    optimizer.step()
-                    optimizer.zero_grad(set_to_none=True)
-                    loss_avg.update(loss.detach_(), bsz)
-                else:
-                    logger.warning("nan loss. noise=%s, noise_pred=%s, paths=%s",noise, noise_pred, [str(b[2]) for b in batch])
-                lr_scheduler.step()
+                progress_bar.update(1)
+                global_step += 1
 
-            if not global_step % args.log_interval:
-                logs = {"loss": loss.item(), "loss_avg": loss_avg.avg.item(), "lr": lr_scheduler.get_last_lr()[0]}
-                progress_bar.set_postfix(**logs)
-                accelerator.log(logs, step=global_step)
+                if global_step >= args.max_train_steps:
+                    break
 
-            loss_heap.append({"loss": loss.item(), "paths": [str(b[2]) for b in batch]})
-            
-            if global_step > args.save_min_steps and not global_step % args.save_interval:
-                save_weights(global_step)
-
-            progress_bar.update(1)
-            global_step += 1
-
+            accelerator.wait_for_everyone()
             if global_step >= args.max_train_steps:
                 break
-
-        accelerator.wait_for_everyone()
-        if global_step >= args.max_train_steps:
-            break
+    
+    except RuntimeError as e:
+        logger.warning(str(e))
+        if "out of memory" in str(e):
+            optimizer.zero_grad()
+            torch.cuda.empty_cache()
 
     save_weights(global_step)
 
