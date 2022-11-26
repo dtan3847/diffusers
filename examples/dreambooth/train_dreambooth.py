@@ -356,6 +356,13 @@ class LatentsDataset(Dataset):
         self.source_dataloader = source_dataloader
         self.args = args
 
+    def clear_latents(self):
+        self.latents_cache = []
+        self.text_encoder_cache = []
+        self.paths = []
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
     def cache_latents(self):
         # Move text_encode and vae to gpu.
         # For mixed precision training we cast the text_encoder and vae weights to half-precision
@@ -397,10 +404,20 @@ class LatentsDataset(Dataset):
     def _dropout_tags(self, prompt, per_tag_chance):
         tags = [t.strip() for t in prompt.split(",")]
         random.shuffle(tags)
-        for i in range(len(tags)):
-            if  torch.rand(1) >= per_tag_chance:
+        exceptions = []
+        rest = []
+        is_exception = lambda tag: tag.startswith("by ")
+        for tag in tags:
+            if is_exception(tag):
+                exceptions.append(tag)
+            else:
+                rest.append(tag)
+        for i in range(len(rest)):
+            if torch.rand(1) >= per_tag_chance:
                 break
-        return ",".join(tags[:i])
+        final = exceptions + rest[:i]
+        random.shuffle(final)
+        return ",".join(final)
 
     def __len__(self):
         return len(self.latents_cache)
@@ -735,7 +752,20 @@ def main():
     try:
         for epoch in range(args.num_train_epochs):
             if not args.not_cache_latents and not first_run:
-                train_dataset.cache_latents()
+                try_count = 0
+                while (True):
+                    try:
+                        train_dataset.cache_latents()
+                        break
+                    except RuntimeError as e:
+                        logger.warning(str(e))
+                        # try up to 3 times
+                        if try_count < 3 and "out of memory" in str(e):
+                            train_dataset.clear_latents()
+                            try_count += 1
+                            continue
+                        raise e
+
             first_run = False
             unet.train()
             for step, batch in enumerate(train_dataloader):
@@ -818,6 +848,8 @@ def main():
         if "out of memory" in str(e):
             optimizer.zero_grad()
             torch.cuda.empty_cache()
+    except KeyboardInterrupt as e:
+        logger.warning("KeyboardInterrupt")
 
     save_weights(global_step)
 
