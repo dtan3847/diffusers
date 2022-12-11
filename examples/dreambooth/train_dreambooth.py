@@ -6,6 +6,7 @@ import random
 import json
 import math
 import os
+import gc
 from contextlib import nullcontext
 from pathlib import Path
 from typing import Optional
@@ -365,12 +366,13 @@ class LatentsDataset(Dataset):
         self.latents_cache[index] = None
         text_latent = self.text_encoder_cache[index]
         self.text_encoder_cache[index] = None
-        return image_latent, text_latent, self.paths[index] if self.paths else None
+        return image_latent, text_latent, self.paths[index], self.captions[index]
 
     def clear_latents(self):
         self.latents_cache = []
         self.text_encoder_cache = []
         self.paths = []
+        self.captions = []
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
 
@@ -385,6 +387,7 @@ class LatentsDataset(Dataset):
         self.latents_cache = []
         self.text_encoder_cache = []
         self.paths = []
+        self.captions = []
         total = limit if limit > -1 and limit < len(self.source_dataloader) else None
         for batch in tqdm(self.source_dataloader, desc="Caching latents", total=total):
             if limit > -1 and len(self) >= limit:
@@ -400,8 +403,10 @@ class LatentsDataset(Dataset):
                         self.paths += batch["paths"]
                         if self.args.train_text_encoder:
                             self.text_encoder_cache.append(batch["prompts"])
+                            self.captions += batch["prompts"]
                         else:
-                            self.text_encoder_cache.append(self._prompts_to_tokens(batch["prompts"]))
+                            tokens, caption = self._prompts_to_tokens(batch["prompts"])
+                            self.text_encoder_cache.append(tokens)
                         done = True
                 except RuntimeError as e:
                     logger.exception("Inside latent caching")
@@ -428,7 +433,7 @@ class LatentsDataset(Dataset):
                 return_tensors="pt"
             ).input_ids.to(self.accelerator.device, non_blocking=True)
         out = encode_tokens(self.text_encoder, input_ids.long(), self.args.use_penultimate)
-        return out
+        return out, prompts
 
     def _dropout_tags(self, prompt, per_tag_chance):
         tags = [t.strip() for t in prompt.split(",")]
@@ -441,10 +446,12 @@ class LatentsDataset(Dataset):
                 exceptions.append(tag)
             else:
                 rest.append(tag)
-        for i in range(len(rest)):
-            if torch.rand(1) >= per_tag_chance:
-                break
-        final = exceptions + rest[:i]
+        final = exceptions
+        if rest:
+            for i in range(len(rest)):
+                if torch.rand(1) >= per_tag_chance:
+                    break
+            final += rest[:i]
         random.shuffle(final)
         return ",".join(final)
 
@@ -756,7 +763,7 @@ def main():
     logger.info(f"  Gradient Accumulation steps = {args.gradient_accumulation_steps}")
     logger.info(f"  Total optimization steps = {args.max_train_steps}")
 
-    def save_weights(step):
+    def save_weights(step, batch=None):
         # Create the pipeline using using the trained modules and save it.
         if accelerator.is_main_process:
             if args.train_text_encoder:
@@ -778,7 +785,11 @@ def main():
             with open(os.path.join(save_dir, "args.json"), "w") as f:
                 json.dump(args.__dict__, f, indent=2)
 
-            if args.save_sample_prompt is not None:
+            prompt = args.save_sample_prompt
+            if batch is not None and len(batch[0]) >= 4:
+                prompt = batch[0][3]
+
+            if prompt is not None:
                 pipeline = pipeline.to(accelerator.device)
                 g_cuda = torch.Generator(device=accelerator.device).manual_seed(args.seed)
                 pipeline.set_progress_bar_config(disable=True)
@@ -787,7 +798,7 @@ def main():
                 with torch.autocast("cuda"), torch.inference_mode():
                     for i in tqdm(range(args.n_save_sample), desc="Generating samples"):
                         images = pipeline(
-                            args.save_sample_prompt,
+                            prompt,
                             width=args.save_width,
                             height=args.save_height,
                             negative_prompt=args.save_sample_negative_prompt,
@@ -797,17 +808,6 @@ def main():
                         ).images
                         images[0].save(os.path.join(sample_dir, f"{i}.png"))
                     g_cuda.seed()
-                    for i in tqdm(range(args.n_save_sample), desc="Generating random samples"):
-                        images = pipeline(
-                            args.save_sample_prompt,
-                            width=args.save_width,
-                            height=args.save_height,
-                            negative_prompt=args.save_sample_negative_prompt,
-                            guidance_scale=args.save_guidance_scale,
-                            num_inference_steps=args.save_infer_steps,
-                            generator=g_cuda
-                        ).images
-                        images[0].save(os.path.join(sample_dir, f"rand-{i}.png"))
                 del pipeline
                 if torch.cuda.is_available():
                     torch.cuda.empty_cache()
@@ -902,7 +902,7 @@ def main():
                         progress_bar.set_postfix(**logs)
                         accelerator.log(logs, step=global_step)
 
-                    loss_heap.append({"loss": loss.item(), "paths": [str(b[2]) for b in batch]})
+                    loss_heap.append({"loss": loss.item(), "paths": [str(b[2]) for b in batch], "captions": [str(b[3]) for b in batch]})
                     
                 except RuntimeError as e:
                     logger.exception("During accumulation")
@@ -913,7 +913,7 @@ def main():
                         raise e
                 
                 if global_step > args.save_min_steps and not global_step % args.save_interval:
-                    save_weights(global_step)
+                    save_weights(global_step, batch)
 
                 progress_bar.update(1)
                 global_step += 1
@@ -933,7 +933,7 @@ def main():
     except KeyboardInterrupt as e:
         logger.warning("KeyboardInterrupt")
 
-    save_weights(global_step)
+    save_weights(global_step, batch)
 
     accelerator.end_training()
     try:
